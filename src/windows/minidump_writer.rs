@@ -3,15 +3,63 @@
 use crate::windows::errors::Error;
 use crate::windows::ffi::{
     capture_context, CloseHandle, GetCurrentProcess, GetCurrentThreadId, GetThreadContext,
-    MiniDumpWriteDump, MinidumpType, OpenProcess, OpenThread, ResumeThread, SuspendThread,
-    EXCEPTION_POINTERS, EXCEPTION_RECORD, FALSE, HANDLE, MINIDUMP_EXCEPTION_INFORMATION,
-    MINIDUMP_USER_STREAM, MINIDUMP_USER_STREAM_INFORMATION, PROCESS_ALL_ACCESS,
-    STATUS_NONCONTINUABLE_EXCEPTION, THREAD_GET_CONTEXT, THREAD_QUERY_INFORMATION,
-    THREAD_SUSPEND_RESUME,
+    MiniDumpWriteDump, MinidumpType, OpenProcess, OpenThread, ResumeThread, SuspendThread, BOOL,
+    EXCEPTION_POINTERS, EXCEPTION_RECORD, FALSE, HANDLE, MINIDUMP_CALLBACK_INFORMATION,
+    MINIDUMP_CALLBACK_INPUT, MINIDUMP_CALLBACK_OUTPUT, MINIDUMP_CALLBACK_TYPE,
+    MINIDUMP_EXCEPTION_INFORMATION, MINIDUMP_USER_STREAM, MINIDUMP_USER_STREAM_INFORMATION,
+    PROCESS_ALL_ACCESS, STATUS_NONCONTINUABLE_EXCEPTION, S_FALSE, S_OK, THREAD_GET_CONTEXT,
+    THREAD_QUERY_INFORMATION, THREAD_SUSPEND_RESUME, TRUE,
 };
 use minidump_common::format::{BreakpadInfoValid, MINIDUMP_BREAKPAD_INFO, MINIDUMP_STREAM_TYPE};
 use scroll::Pwrite;
-use std::os::windows::io::AsRawHandle;
+use std::ffi::c_void;
+use std::slice;
+
+pub unsafe extern "system" fn minidump_callback_routine(
+    buf: *mut std::ffi::c_void,
+    callback_input_ptr: *const MINIDUMP_CALLBACK_INPUT,
+    callback_output_ptr: *mut MINIDUMP_CALLBACK_OUTPUT,
+) -> BOOL {
+    let callback_output = &mut *callback_output_ptr;
+    let callback_input = &*callback_input_ptr;
+    let callback_type = if callback_input.CallbackType <= 20 {
+        unsafe { std::mem::transmute(callback_input.CallbackType) }
+    } else {
+        return FALSE;
+    };
+
+    match callback_type {
+        MINIDUMP_CALLBACK_TYPE::IoStartCallback => {
+            callback_output.Anonymous.Status = S_FALSE;
+            return TRUE;
+        }
+        MINIDUMP_CALLBACK_TYPE::IoWriteAllCallback => {
+            callback_output.Anonymous.Status = S_OK;
+            let out_vec = buf as *mut Vec<u8>;
+            let vec = &mut *out_vec;
+
+            let current_buf_size = vec.len();
+            let offset = callback_input.Anonymous.Io.Offset as usize;
+            let source_len = callback_input.Anonymous.Io.BufferBytes as usize;
+            let bytes_and_offset = offset + source_len;
+            if bytes_and_offset >= current_buf_size {
+                vec.resize(bytes_and_offset, 0);
+            }
+
+            let source = callback_input.Anonymous.Io.Buffer as *mut c_void;
+            let slice = vec.as_mut_slice();
+            let copy_to = &mut slice[offset..bytes_and_offset];
+            let source_slice = slice::from_raw_parts(source as *const u8, source_len);
+            copy_to.copy_from_slice(source_slice);
+            return TRUE;
+        }
+        MINIDUMP_CALLBACK_TYPE::IoFinishCallback => {
+            callback_output.Anonymous.Status = S_OK;
+            return TRUE;
+        }
+        _ => return TRUE,
+    }
+}
 
 pub struct MinidumpWriter {
     /// Optional exception information
@@ -47,8 +95,7 @@ impl MinidumpWriter {
         exception_code: Option<i32>,
         thread_id: Option<u32>,
         minidump_type: Option<MinidumpType>,
-        destination: &mut std::fs::File,
-    ) -> Result<(), Error> {
+    ) -> Result<Vec<u8>, Error> {
         let exception_code = exception_code.unwrap_or(STATUS_NONCONTINUABLE_EXCEPTION);
 
         // SAFETY: syscalls, while this encompasses most of the function, the user
@@ -130,7 +177,7 @@ impl MinidumpWriter {
                 exception_code,
             };
 
-            Self::dump_crash_context(cc, minidump_type, destination)
+            Self::dump_crash_context(cc, minidump_type)
         }
     }
 
@@ -151,8 +198,7 @@ impl MinidumpWriter {
     pub fn dump_crash_context(
         crash_context: crash_context::CrashContext,
         minidump_type: Option<MinidumpType>,
-        destination: &mut std::fs::File,
-    ) -> Result<(), Error> {
+    ) -> Result<Vec<u8>, Error> {
         let pid = crash_context.process_id;
 
         // SAFETY: syscalls
@@ -205,15 +251,11 @@ impl MinidumpWriter {
             is_external_process,
         };
 
-        mdw.dump(minidump_type, destination)
+        mdw.dump(minidump_type)
     }
 
     /// Writes a minidump to the specified file
-    fn dump(
-        mut self,
-        minidump_type: Option<MinidumpType>,
-        destination: &mut std::fs::File,
-    ) -> Result<(), Error> {
+    fn dump(mut self, minidump_type: Option<MinidumpType>) -> Result<Vec<u8>, Error> {
         let exc_info = self.exc_info.take();
 
         let mut user_streams = Vec::with_capacity(1);
@@ -234,6 +276,12 @@ impl MinidumpWriter {
             UserStreamArray: user_streams.as_mut_ptr(),
         };
 
+        let mut out_vec = Vec::new();
+        let mut callback_info = MINIDUMP_CALLBACK_INFORMATION {
+            CallbackRoutine: Some(minidump_callback_routine),
+            CallbackParam: &mut out_vec as *mut Vec<u8> as *mut c_void,
+        };
+
         // Write the actual minidump
         // https://docs.microsoft.com/en-us/windows/win32/api/minidumpapiset/nf-minidumpapiset-minidumpwritedump
         // SAFETY: syscall
@@ -241,20 +289,20 @@ impl MinidumpWriter {
             MiniDumpWriteDump(
                 self.crashing_process, // HANDLE to the process with the crash we want to capture
                 self.pid,              // process id
-                destination.as_raw_handle() as HANDLE, // file to write the minidump to
+                0,                     // writing to memory, no file handle needed
                 minidump_type.unwrap_or(MinidumpType::Normal),
                 exc_info
                     .as_ref()
                     .map_or(std::ptr::null(), |ei| ei as *const _), // exceptionparam - the actual exception information
                 &user_stream_infos, // user streams
-                std::ptr::null(),   // callback, unused
+                &mut callback_info, // callback
             )
         };
 
         if ret == 0 {
             Err(std::io::Error::last_os_error().into())
         } else {
-            Ok(())
+            Ok(out_vec)
         }
     }
 
