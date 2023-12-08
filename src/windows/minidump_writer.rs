@@ -4,11 +4,11 @@ use crate::windows::errors::Error;
 use crate::windows::ffi::{
     capture_context, CloseHandle, GetCurrentProcess, GetCurrentThreadId, GetThreadContext,
     MiniDumpWriteDump, MinidumpType, OpenProcess, OpenThread, ResumeThread, SuspendThread, BOOL,
-    EXCEPTION_POINTERS, EXCEPTION_RECORD, FALSE, HANDLE, MINIDUMP_CALLBACK_INFORMATION,
-    MINIDUMP_CALLBACK_INPUT, MINIDUMP_CALLBACK_OUTPUT, MINIDUMP_CALLBACK_TYPE,
-    MINIDUMP_EXCEPTION_INFORMATION, MINIDUMP_USER_STREAM, MINIDUMP_USER_STREAM_INFORMATION,
-    PROCESS_ALL_ACCESS, STATUS_NONCONTINUABLE_EXCEPTION, S_FALSE, S_OK, THREAD_GET_CONTEXT,
-    THREAD_QUERY_INFORMATION, THREAD_SUSPEND_RESUME, TRUE,
+    CONTEXT_ALL, EXCEPTION_POINTERS, EXCEPTION_RECORD, FALSE, HANDLE,
+    MINIDUMP_CALLBACK_INFORMATION, MINIDUMP_CALLBACK_INPUT, MINIDUMP_CALLBACK_OUTPUT,
+    MINIDUMP_CALLBACK_TYPE, MINIDUMP_EXCEPTION_INFORMATION, MINIDUMP_USER_STREAM,
+    MINIDUMP_USER_STREAM_INFORMATION, PROCESS_ALL_ACCESS, STATUS_NONCONTINUABLE_EXCEPTION, S_FALSE,
+    S_OK, THREAD_GET_CONTEXT, THREAD_QUERY_INFORMATION, THREAD_SUSPEND_RESUME, TRUE,
 };
 use minidump_common::format::{BreakpadInfoValid, MINIDUMP_BREAKPAD_INFO, MINIDUMP_STREAM_TYPE};
 use scroll::Pwrite;
@@ -86,6 +86,9 @@ impl MinidumpWriter {
     /// process, at least in the event of an actual exception. It is recommended
     /// to dump from an external process if possible via [`Self::dump_crash_context`]
     ///
+    /// `out_vec` can be specified to use a pre-allocated Vec<u8> at crash time to avoid
+    /// allocating memory during an in-process dump.
+    ///
     /// # Errors
     ///
     /// In addition to the errors described in [`Self::dump_crash_context`], this
@@ -95,6 +98,7 @@ impl MinidumpWriter {
         exception_code: Option<i32>,
         thread_id: Option<u32>,
         minidump_type: Option<MinidumpType>,
+        out_vec: Option<Vec<u8>>,
     ) -> Result<Vec<u8>, Error> {
         let exception_code = exception_code.unwrap_or(STATUS_NONCONTINUABLE_EXCEPTION);
 
@@ -102,7 +106,7 @@ impl MinidumpWriter {
         // has no invariants to uphold so the entire function is not marked unsafe
         unsafe {
             let mut exception_context = if let Some(tid) = thread_id {
-                let mut ec = std::mem::MaybeUninit::uninit();
+                let mut ec = std::mem::MaybeUninit::zeroed();
 
                 // We need to suspend the thread to get its context, which would be bad
                 // if it's the current thread, so we check it early before regrets happen
@@ -140,6 +144,8 @@ impl MinidumpWriter {
                         return Err(Error::ThreadSuspend(std::io::Error::last_os_error()));
                     }
 
+                    // Set ContextFlags to specify we want the entire processor context to be captured.
+                    (*ec.as_mut_ptr()).ContextFlags = CONTEXT_ALL;
                     // https://docs.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-getthreadcontext
                     if GetThreadContext(thread_handle.0, ec.as_mut_ptr()) == 0 {
                         // Try to be a good citizen and resume the thread
@@ -177,7 +183,7 @@ impl MinidumpWriter {
                 exception_code,
             };
 
-            Self::dump_crash_context(cc, minidump_type)
+            Self::dump_crash_context(cc, minidump_type, out_vec)
         }
     }
 
@@ -198,6 +204,7 @@ impl MinidumpWriter {
     pub fn dump_crash_context(
         crash_context: crash_context::CrashContext,
         minidump_type: Option<MinidumpType>,
+        out_vec: Option<Vec<u8>>,
     ) -> Result<Vec<u8>, Error> {
         let pid = crash_context.process_id;
 
@@ -251,11 +258,15 @@ impl MinidumpWriter {
             is_external_process,
         };
 
-        mdw.dump(minidump_type)
+        mdw.dump(minidump_type, out_vec)
     }
 
     /// Writes a minidump to the specified file
-    fn dump(mut self, minidump_type: Option<MinidumpType>) -> Result<Vec<u8>, Error> {
+    fn dump(
+        mut self,
+        minidump_type: Option<MinidumpType>,
+        out_vec: Option<Vec<u8>>,
+    ) -> Result<Vec<u8>, Error> {
         let exc_info = self.exc_info.take();
 
         let mut user_streams = Vec::with_capacity(1);
@@ -276,7 +287,7 @@ impl MinidumpWriter {
             UserStreamArray: user_streams.as_mut_ptr(),
         };
 
-        let mut out_vec = Vec::new();
+        let mut out_vec = out_vec.unwrap_or_default();
         let mut callback_info = MINIDUMP_CALLBACK_INFORMATION {
             CallbackRoutine: Some(minidump_callback_routine),
             CallbackParam: &mut out_vec as *mut Vec<u8> as *mut c_void,
@@ -324,7 +335,7 @@ impl MinidumpWriter {
         let bp_info = MINIDUMP_BREAKPAD_INFO {
             validity: BreakpadInfoValid::DumpThreadId.bits()
                 | BreakpadInfoValid::RequestingThreadId.bits(),
-            dump_thread_id: self.tid,
+            dump_thread_id: unsafe { GetCurrentThreadId() },
             // SAFETY: syscall
             requesting_thread_id: unsafe { GetCurrentThreadId() },
         };

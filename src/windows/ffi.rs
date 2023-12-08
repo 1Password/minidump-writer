@@ -34,6 +34,28 @@ pub const THREAD_SUSPEND_RESUME: THREAD_ACCESS_RIGHTS = 2;
 pub const THREAD_GET_CONTEXT: THREAD_ACCESS_RIGHTS = 8;
 pub const THREAD_QUERY_INFORMATION: THREAD_ACCESS_RIGHTS = 64;
 
+#[allow(non_camel_case_types)]
+pub type CONTEXT_FLAGS = u32;
+
+pub const CONTEXT_ALL_ARM: CONTEXT_FLAGS = 2097167u32;
+pub const CONTEXT_ALL_ARM64: CONTEXT_FLAGS = 4194335u32;
+pub const CONTEXT_ALL_X86: CONTEXT_FLAGS = 65599u32;
+pub const CONTEXT_ALL_AMD64: CONTEXT_FLAGS = 1048607u32;
+
+pub const CONTEXT_ALL: CONTEXT_FLAGS = {
+    if cfg!(target_arch = "x86") {
+        CONTEXT_ALL_X86
+    } else if cfg!(target_arch = "x86_64") {
+        CONTEXT_ALL_AMD64
+    } else if cfg!(target_arch = "arm") {
+        CONTEXT_ALL_ARM
+    } else if cfg!(target_arch = "aarch64") {
+        CONTEXT_ALL_ARM64
+    } else {
+        panic!("unknown arch")
+    }
+};
+
 bitflags::bitflags! {
     /// <https://learn.microsoft.com/en-us/windows/win32/api/minidumpapiset/ne-minidumpapiset-minidump_type>
     #[derive(Copy, Clone, Debug)]
