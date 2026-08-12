@@ -19,7 +19,10 @@ pub use crash_context::{capture_context, CONTEXT, EXCEPTION_POINTERS, EXCEPTION_
 pub type HANDLE = isize;
 pub type BOOL = i32;
 pub const FALSE: BOOL = 0;
+pub const TRUE: BOOL = 1;
 
+pub const S_OK: i32 = 0;
+pub const S_FALSE: i32 = 1;
 pub type Hresult = i32;
 pub const STATUS_NONCONTINUABLE_EXCEPTION: i32 = -1073741787;
 
@@ -30,6 +33,28 @@ pub type THREAD_ACCESS_RIGHTS = u32;
 pub const THREAD_SUSPEND_RESUME: THREAD_ACCESS_RIGHTS = 2;
 pub const THREAD_GET_CONTEXT: THREAD_ACCESS_RIGHTS = 8;
 pub const THREAD_QUERY_INFORMATION: THREAD_ACCESS_RIGHTS = 64;
+
+#[allow(non_camel_case_types)]
+pub type CONTEXT_FLAGS = u32;
+
+pub const CONTEXT_ALL_ARM: CONTEXT_FLAGS = 2097167u32;
+pub const CONTEXT_ALL_ARM64: CONTEXT_FLAGS = 4194335u32;
+pub const CONTEXT_ALL_X86: CONTEXT_FLAGS = 65599u32;
+pub const CONTEXT_ALL_AMD64: CONTEXT_FLAGS = 1048607u32;
+
+pub const CONTEXT_ALL: CONTEXT_FLAGS = {
+    if cfg!(target_arch = "x86") {
+        CONTEXT_ALL_X86
+    } else if cfg!(target_arch = "x86_64") {
+        CONTEXT_ALL_AMD64
+    } else if cfg!(target_arch = "arm") {
+        CONTEXT_ALL_ARM
+    } else if cfg!(target_arch = "aarch64") {
+        CONTEXT_ALL_ARM64
+    } else {
+        panic!("unknown arch")
+    }
+};
 
 bitflags::bitflags! {
     /// <https://learn.microsoft.com/en-us/windows/win32/api/minidumpapiset/ne-minidumpapiset-minidump_type>
@@ -136,6 +161,34 @@ bitflags::bitflags! {
         /// Exclude all memory with the virtual protection attribute of [`PAGE_WRITECOMBINE`](https://learn.microsoft.com/en-us/windows/win32/memory/memory-protection-constants).
         const FilterWriteCombinedMemory = 1 << 24;
     }
+}
+
+// Define enum for MINIDUMP_CALLBACK_TYPE
+#[allow(non_camel_case_types)]
+#[allow(dead_code)]
+#[repr(u32)]
+pub enum MINIDUMP_CALLBACK_TYPE {
+    ModuleCallback = 0,
+    ThreadCallback = 1,
+    ThreadExCallback = 2,
+    IncludeThreadCallback = 3,
+    IncludeModuleCallback = 4,
+    MemoryCallback = 5,
+    CancelCallback = 6,
+    WriteKernelMinidumpCallback = 7,
+    KernelMinidumpStatusCallback = 8,
+    RemoveMemoryCallback = 9,
+    IncludeVmRegionCallback = 10,
+    IoStartCallback = 11,
+    IoWriteAllCallback = 12,
+    IoFinishCallback = 13,
+    ReadMemoryFailureCallback = 14,
+    SecondaryFlagsCallback = 15,
+    IsProcessSnapshotCallback = 16,
+    VmStartCallback = 17,
+    VmQueryCallback = 18,
+    VmPreReadCallback = 19,
+    VmPostReadCallback = 20,
 }
 
 pub type VS_FIXEDFILEINFO_FILE_FLAGS = u32;

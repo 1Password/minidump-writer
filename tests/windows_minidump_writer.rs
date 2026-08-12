@@ -31,20 +31,10 @@ fn get_crash_reason<'a, T: std::ops::Deref<Target = [u8]> + 'a>(
 /// not necessarily the primary intended use case of out-of-process dumping
 #[test]
 fn dump_current_process() {
-    let mut tmpfile = tempfile::Builder::new()
-        .prefix("windows_current_process")
-        .tempfile()
-        .unwrap();
+    let data = MinidumpWriter::dump_local_context(Some(STATUS_INVALID_PARAMETER), None, None)
+        .expect("failed to write minidump");
 
-    MinidumpWriter::dump_local_context(
-        Some(STATUS_INVALID_PARAMETER),
-        None,
-        None,
-        tmpfile.as_file_mut(),
-    )
-    .expect("failed to write minidump");
-
-    let md = Minidump::read_path(tmpfile.path()).expect("failed to read minidump");
+    let md = Minidump::read(data).expect("failed to read minidump");
 
     let _: MinidumpThreadList = md.get_stream().expect("Couldn't find MinidumpThreadList");
     let _: MinidumpMemoryList = md.get_stream().expect("Couldn't find MinidumpMemoryList");
@@ -69,11 +59,6 @@ fn dump_current_process() {
 
 #[test]
 fn dump_specific_thread() {
-    let mut tmpfile = tempfile::Builder::new()
-        .prefix("windows_current_process")
-        .tempfile()
-        .unwrap();
-
     let (tx, rx) = std::sync::mpsc::channel();
 
     let jh = std::thread::spawn(move || {
@@ -86,18 +71,17 @@ fn dump_specific_thread() {
 
     let crashing_thread_id = rx.recv().unwrap();
 
-    MinidumpWriter::dump_local_context(
+    let data = MinidumpWriter::dump_local_context(
         Some(STATUS_INVALID_PARAMETER),
         Some(crashing_thread_id),
         None,
-        tmpfile.as_file_mut(),
     )
     .expect("failed to write minidump");
 
     drop(rx);
     jh.join().unwrap();
 
-    let md = Minidump::read_path(tmpfile.path()).expect("failed to read minidump");
+    let md = Minidump::read(data).expect("failed to read minidump");
 
     let _: MinidumpThreadList = md.get_stream().expect("Couldn't find MinidumpThreadList");
     let _: MinidumpMemoryList = md.get_stream().expect("Couldn't find MinidumpMemoryList");
@@ -157,19 +141,14 @@ fn dump_external_process() {
         exception_code,
     };
 
-    let mut tmpfile = tempfile::Builder::new()
-        .prefix("windows_external_process")
-        .tempfile()
-        .unwrap();
-
     // SAFETY: We keep the process we are dumping alive until the minidump is written
     // and the test process keep the pointers it sent us alive until it is killed
-    MinidumpWriter::dump_crash_context(crash_context, None, tmpfile.as_file_mut())
-        .expect("failed to write minidump");
+    let data =
+        MinidumpWriter::dump_crash_context(crash_context, None).expect("failed to write minidump");
 
     child.kill().expect("failed to kill child");
 
-    let md = Minidump::read_path(tmpfile.path()).expect("failed to read minidump");
+    let md = Minidump::read(data).expect("failed to read minidump");
 
     let _: MinidumpThreadList = md.get_stream().expect("Couldn't find MinidumpThreadList");
     let _: MinidumpMemoryList = md.get_stream().expect("Couldn't find MinidumpMemoryList");

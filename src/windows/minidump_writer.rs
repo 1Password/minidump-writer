@@ -3,15 +3,63 @@
 use crate::windows::errors::Error;
 use crate::windows::ffi::{
     capture_context, CloseHandle, GetCurrentProcess, GetCurrentThreadId, GetThreadContext,
-    MiniDumpWriteDump, MinidumpType, OpenProcess, OpenThread, ResumeThread, SuspendThread,
-    EXCEPTION_POINTERS, EXCEPTION_RECORD, FALSE, HANDLE, MINIDUMP_EXCEPTION_INFORMATION,
-    MINIDUMP_USER_STREAM, MINIDUMP_USER_STREAM_INFORMATION, PROCESS_ALL_ACCESS,
-    STATUS_NONCONTINUABLE_EXCEPTION, THREAD_GET_CONTEXT, THREAD_QUERY_INFORMATION,
-    THREAD_SUSPEND_RESUME,
+    MiniDumpWriteDump, MinidumpType, OpenProcess, OpenThread, ResumeThread, SuspendThread, BOOL,
+    CONTEXT_ALL, EXCEPTION_POINTERS, EXCEPTION_RECORD, FALSE, HANDLE,
+    MINIDUMP_CALLBACK_INFORMATION, MINIDUMP_CALLBACK_INPUT, MINIDUMP_CALLBACK_OUTPUT,
+    MINIDUMP_CALLBACK_TYPE, MINIDUMP_EXCEPTION_INFORMATION, MINIDUMP_USER_STREAM,
+    MINIDUMP_USER_STREAM_INFORMATION, PROCESS_ALL_ACCESS, STATUS_NONCONTINUABLE_EXCEPTION, S_FALSE,
+    S_OK, THREAD_GET_CONTEXT, THREAD_QUERY_INFORMATION, THREAD_SUSPEND_RESUME, TRUE,
 };
 use minidump_common::format::{BreakpadInfoValid, MINIDUMP_BREAKPAD_INFO, MINIDUMP_STREAM_TYPE};
 use scroll::Pwrite;
-use std::os::windows::io::AsRawHandle;
+use std::ffi::c_void;
+use std::slice;
+
+pub unsafe extern "system" fn minidump_callback_routine(
+    buf: *mut std::ffi::c_void,
+    callback_input_ptr: *const MINIDUMP_CALLBACK_INPUT,
+    callback_output_ptr: *mut MINIDUMP_CALLBACK_OUTPUT,
+) -> BOOL {
+    let callback_output = &mut *callback_output_ptr;
+    let callback_input = &*callback_input_ptr;
+    let callback_type = if callback_input.CallbackType <= 20 {
+        unsafe { std::mem::transmute(callback_input.CallbackType) }
+    } else {
+        return FALSE;
+    };
+
+    match callback_type {
+        MINIDUMP_CALLBACK_TYPE::IoStartCallback => {
+            callback_output.Anonymous.Status = S_FALSE;
+            return TRUE;
+        }
+        MINIDUMP_CALLBACK_TYPE::IoWriteAllCallback => {
+            callback_output.Anonymous.Status = S_OK;
+            let out_vec = buf as *mut Vec<u8>;
+            let vec = &mut *out_vec;
+
+            let current_buf_size = vec.len();
+            let offset = callback_input.Anonymous.Io.Offset as usize;
+            let source_len = callback_input.Anonymous.Io.BufferBytes as usize;
+            let bytes_and_offset = offset + source_len;
+            if bytes_and_offset >= current_buf_size {
+                vec.resize(bytes_and_offset, 0);
+            }
+
+            let source = callback_input.Anonymous.Io.Buffer as *mut c_void;
+            let slice = vec.as_mut_slice();
+            let copy_to = &mut slice[offset..bytes_and_offset];
+            let source_slice = slice::from_raw_parts(source as *const u8, source_len);
+            copy_to.copy_from_slice(source_slice);
+            return TRUE;
+        }
+        MINIDUMP_CALLBACK_TYPE::IoFinishCallback => {
+            callback_output.Anonymous.Status = S_OK;
+            return TRUE;
+        }
+        _ => return TRUE,
+    }
+}
 
 pub struct MinidumpWriter {
     /// Optional exception information
@@ -27,6 +75,9 @@ pub struct MinidumpWriter {
     exception_code: i32,
     /// Whether we are dumping the current process or not
     is_external_process: bool,
+    /// Whether this struct owns the crashing_process handle and should close it on drop.
+    /// False when the handle was provided by the caller.
+    owns_handle: bool,
 }
 
 impl MinidumpWriter {
@@ -38,6 +89,9 @@ impl MinidumpWriter {
     /// process, at least in the event of an actual exception. It is recommended
     /// to dump from an external process if possible via [`Self::dump_crash_context`]
     ///
+    /// `out_vec` can be specified to use a pre-allocated Vec<u8> at crash time to avoid
+    /// allocating memory during an in-process dump.
+    ///
     /// # Errors
     ///
     /// In addition to the errors described in [`Self::dump_crash_context`], this
@@ -47,15 +101,15 @@ impl MinidumpWriter {
         exception_code: Option<i32>,
         thread_id: Option<u32>,
         minidump_type: Option<MinidumpType>,
-        destination: &mut std::fs::File,
-    ) -> Result<(), Error> {
+        out_vec: Option<Vec<u8>>,
+    ) -> Result<Vec<u8>, Error> {
         let exception_code = exception_code.unwrap_or(STATUS_NONCONTINUABLE_EXCEPTION);
 
         // SAFETY: syscalls, while this encompasses most of the function, the user
         // has no invariants to uphold so the entire function is not marked unsafe
         unsafe {
             let mut exception_context = if let Some(tid) = thread_id {
-                let mut ec = std::mem::MaybeUninit::uninit();
+                let mut ec = std::mem::MaybeUninit::zeroed();
 
                 // We need to suspend the thread to get its context, which would be bad
                 // if it's the current thread, so we check it early before regrets happen
@@ -93,6 +147,8 @@ impl MinidumpWriter {
                         return Err(Error::ThreadSuspend(std::io::Error::last_os_error()));
                     }
 
+                    // Set ContextFlags to specify we want the entire processor context to be captured.
+                    (*ec.as_mut_ptr()).ContextFlags = CONTEXT_ALL;
                     // https://docs.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-getthreadcontext
                     if GetThreadContext(thread_handle.0, ec.as_mut_ptr()) == 0 {
                         // Try to be a good citizen and resume the thread
@@ -130,7 +186,7 @@ impl MinidumpWriter {
                 exception_code,
             };
 
-            Self::dump_crash_context(cc, minidump_type, destination)
+            Self::dump_crash_context(cc, None, minidump_type, out_vec)
         }
     }
 
@@ -150,14 +206,17 @@ impl MinidumpWriter {
     /// for the duration of this function call.
     pub fn dump_crash_context(
         crash_context: crash_context::CrashContext,
+        process_handle: Option<HANDLE>,
         minidump_type: Option<MinidumpType>,
-        destination: &mut std::fs::File,
-    ) -> Result<(), Error> {
+        out_vec: Option<Vec<u8>>,
+    ) -> Result<Vec<u8>, Error> {
         let pid = crash_context.process_id;
 
         // SAFETY: syscalls
-        let (crashing_process, is_external_process) = unsafe {
-            if pid != std::process::id() {
+        let (crashing_process, is_external_process, owns_handle) = unsafe {
+            if let Some(handle) = process_handle {
+                (handle, true, false)
+            } else if pid != std::process::id() {
                 let proc = OpenProcess(
                     PROCESS_ALL_ACCESS, // desired access
                     FALSE,              // inherit handles
@@ -168,9 +227,9 @@ impl MinidumpWriter {
                     return Err(std::io::Error::last_os_error().into());
                 }
 
-                (proc, true)
+                (proc, true, true)
             } else {
-                (GetCurrentProcess(), false)
+                (GetCurrentProcess(), false, true)
             }
         };
 
@@ -203,17 +262,18 @@ impl MinidumpWriter {
             tid,
             exception_code,
             is_external_process,
+            owns_handle,
         };
 
-        mdw.dump(minidump_type, destination)
+        mdw.dump(minidump_type, out_vec)
     }
 
     /// Writes a minidump to the specified file
     fn dump(
         mut self,
         minidump_type: Option<MinidumpType>,
-        destination: &mut std::fs::File,
-    ) -> Result<(), Error> {
+        out_vec: Option<Vec<u8>>,
+    ) -> Result<Vec<u8>, Error> {
         let exc_info = self.exc_info.take();
 
         let mut user_streams = Vec::with_capacity(1);
@@ -234,6 +294,12 @@ impl MinidumpWriter {
             UserStreamArray: user_streams.as_mut_ptr(),
         };
 
+        let mut out_vec = out_vec.unwrap_or_default();
+        let mut callback_info = MINIDUMP_CALLBACK_INFORMATION {
+            CallbackRoutine: Some(minidump_callback_routine),
+            CallbackParam: &mut out_vec as *mut Vec<u8> as *mut c_void,
+        };
+
         // Write the actual minidump
         // https://docs.microsoft.com/en-us/windows/win32/api/minidumpapiset/nf-minidumpapiset-minidumpwritedump
         // SAFETY: syscall
@@ -241,20 +307,20 @@ impl MinidumpWriter {
             MiniDumpWriteDump(
                 self.crashing_process, // HANDLE to the process with the crash we want to capture
                 self.pid,              // process id
-                destination.as_raw_handle() as HANDLE, // file to write the minidump to
+                -1isize as HANDLE,     // INVALID_HANDLE_VALUE: writing to memory via callback
                 minidump_type.unwrap_or(MinidumpType::Normal),
                 exc_info
                     .as_ref()
                     .map_or(std::ptr::null(), |ei| ei as *const _), // exceptionparam - the actual exception information
                 &user_stream_infos, // user streams
-                std::ptr::null(),   // callback, unused
+                &mut callback_info, // callback
             )
         };
 
         if ret == 0 {
             Err(std::io::Error::last_os_error().into())
         } else {
-            Ok(())
+            Ok(out_vec)
         }
     }
 
@@ -276,7 +342,7 @@ impl MinidumpWriter {
         let bp_info = MINIDUMP_BREAKPAD_INFO {
             validity: BreakpadInfoValid::DumpThreadId.bits()
                 | BreakpadInfoValid::RequestingThreadId.bits(),
-            dump_thread_id: self.tid,
+            dump_thread_id: unsafe { GetCurrentThreadId() },
             // SAFETY: syscall
             requesting_thread_id: unsafe { GetCurrentThreadId() },
         };
@@ -298,12 +364,14 @@ impl MinidumpWriter {
 
 impl Drop for MinidumpWriter {
     fn drop(&mut self) {
-        // Note we close the handle regardless of whether it is the local handle
-        // or an external one, as noted in the docs
-        //
-        // > The pseudo handle need not be closed when it is no longer needed.
-        // > Calling the CloseHandle function with a pseudo handle has no effect.
-        // SAFETY: syscall
-        unsafe { CloseHandle(self.crashing_process) };
+        if self.owns_handle {
+            // Note we close the handle regardless of whether it is the local handle
+            // or an external one, as noted in the docs
+            //
+            // > The pseudo handle need not be closed when it is no longer needed.
+            // > Calling the CloseHandle function with a pseudo handle has no effect.
+            // SAFETY: syscall
+            unsafe { CloseHandle(self.crashing_process) };
+        }
     }
 }
